@@ -1,121 +1,132 @@
-# FQ Toolbox Docker Image
+# FQ Toolbox Docker image  
+_`fqtools` + a **fully-matched HTS stack v 1.21** (samtools / bcftools / htslib)_  
 
-A self-contained container with
-
-| Tool | Version | Notes |
-|------|---------|-------|
-| Ubuntu | 22.04 | glibc 2.35 |
-| HTSlib | 1.21 | last release with `<sam.h>` in project root |
-| samtools | 1.21 | matches HTSlib ABI |
-| bcftools | 1.21 | matches HTSlib ABI |
-| fqtools | latest (`main`) | **patched** for issue [#18](https://github.com/alastair-droop/fqtools/issues/18) |
-
-## Why the 1.21 stack?
-
-HTSlib ≥ 1.22 moved header files to `htslib/`, breaking `fqtools`, which
-still does:
-
-```c
-#include <sam.h>
-
-Instead of patching dozens of includes, we
-	1.	build HTSlib 1.21, where sam.h and bam.h are still in the
-top-level directory, and
-	2.	one-line-patch fqheader.h to point at
-"htslib/sam.h" / "htslib/bam.h" (exactly the workaround discussed
-in issue #18).
-
-Everything now compiles and links without touching the rest of the
-source tree.
+[![Docker Automated build](https://img.shields.io/badge/docker-build-green)](https://hub.docker.com/r/<your-org>/fqtools)
 
 ---
 
-## Quick start
+## Why we pin everything to **1.21**
+
+| component | upstream 1.22+ change | breakage observed | workaround in this image |
+|-----------|-----------------------|-------------------|--------------------------|
+| **HTSlib** | `<sam.h>`, `<bam.h>` and friends moved from the project root into `htslib/` | `fqtools` still does <br>`#include <sam.h>` → compile fails (`fatal error: sam.h`) | ship **HTSlib 1.21** (last release with “legacy” headers) and patch `fqtools` to include `htslib/sam.h` for future-proofing |
+| **samtools / bcftools** | must be **ABI-compatible** with the same HTSlib | mixing versions triggers runtime loader errors | build **samtools 1.21** and **bcftools 1.21** from tarballs |
+| **GCC 10+** (default on Ubuntu 22.04) | new default `-fno-common` breaks a few duplicated globals in `fqtools` | linker errors with “multiple definition …” | compile `fqtools` with `-fcommon` |
+
+Keeping the whole stack on **1.21** means:
+
+* no source-level patches to third-party code  
+* stable ABI / headers for every program inside the container  
+* reproducible results across clusters and CI
+
+---
+
+## Image layout
+
+| stage | why it exists |
+|-------|---------------|
+| **HTS stack build** | build & install HTSlib 1.21 + samtools / bcftools 1.21 – provides the runtime libraries and CLIs you already know (`samtools`, `bgzip`, `tabix`, …) |
+| **`fqtools` build** | *vendored* copy of HTSlib 1.21 is built **only for its headers** so that `fqtools` can compile; binary is installed to `/usr/local/bin/fqtools` |
+| **strip tool-chain** | we remove the compiler & dev packages afterwards so the final image stays slim (~125 MB) |
+
+---
+
+## Build the image (one-off)
 
 ```bash
-# clone repo (or just copy Dockerfile) and build once
+git clone https://github.com/<your-org>/fqtools-docker.git
+cd fqtools-docker
 docker build -t fqtools:1.21 .
-
-
+```
 
 ⸻
 
-Non-interactive batch recipes
+Run fqtools non-interactively on many FASTQ files
 
-Assume your host folder contains compressed FASTQ files:
+Assume you have:
 
-/home/user/reads/
- ├── sampleA_R1.fq.gz
- ├── sampleA_R2.fq.gz
- └── sampleB_R1.fq.gz
+/home/alice/reads/
+  ├─ sampleA_R1.fq.gz
+  ├─ sampleA_R2.fq.gz
+  ├─ sampleB_R1.fq.gz
+  └─ …
 
-Mounts used below
-	•	/in  – read-only view of your data (:ro)
-	•	/out – same host folder, but writable, to save results
+1  Validate every file (batch loop)
 
-1  Validate every file
-
+```
 docker run --rm \
-  -v /home/user/reads:/in:ro \
-  -v /home/user/reads:/out \
+  -v /home/alice/reads:/in:ro \
+  -v /home/alice/reads:/out \
   fqtools:1.21 \
   bash -c 'for f in /in/*.fq.gz; do
               fqtools validate "$f" \
-              > "/out/$(basename "$f").validation";
+                > "/out/$(basename "$f").validation";
            done'
+```
 
-Each *.validation report lands next to its source FASTQ.
+	•	read-only bind for safety (/in)
+	•	same folder re-mounted writeable (/out)
+	•	container vanishes when loop is done (--rm)
 
-⸻
+2  Read-length histogram for one sample
 
-2  Read-length histogram for one file
-
-docker run --rm \
-  -v /home/user/reads:/data:ro \
-  fqtools:1.21 \
+docker run --rm -v /home/alice/reads:/data:ro fqtools:1.21 \
   fqtools lengthtab /data/sampleA_R1.fq.gz \
-  > /home/user/reads/sampleA_R1.len
+  > /home/alice/reads/sampleA_R1.lengths.txt
 
-
-
-⸻
-
-3  Convert every R1 file to FASTA
+3  Convert all *_R1.fq.gz to FASTA
 
 docker run --rm \
-  -v /home/user/reads:/in:ro \
-  -v /home/user/reads:/out \
+  -v /home/alice/reads:/in:ro \
+  -v /home/alice/reads:/out \
   fqtools:1.21 \
   bash -c 'for f in /in/*_R1.fq.gz; do
-              base=$(basename "${f/_R1.fq.gz/}");
-              fqtools fasta "$f" > "/out/${base}.fa";
+              base=${f##*/}; base=${base/_R1.fq.gz/}
+              fqtools fasta "$f" > "/out/${base}.fa"
            done'
 
+4  Pipe data through stdin (no file inside the container)
 
-
-⸻
-
-4  Stream from stdin (no temp files)
-
-zcat /home/user/reads/sampleA_R1.fq.gz | \
+zcat /home/alice/reads/sampleA_R1.fq.gz | \
   docker run --rm -i fqtools:1.21 fqtools stats -
 
 
 
 ⸻
 
-Container principles
+Design principles
 
-Principle	How it’s met here
-Isolation	All compilers / libs live inside the image; host stays clean.
-Reproducibility	Exact versions pinned (Ubuntu 22.04 + HTS 1.21 stack).
-Stateless	--rm removes the container when the job ends.
-Volume mounts	-v host:container passes data without copying.
-Batch automation	Loops run under bash -c '…', perfect for pipelines/HPC.
+principle	manifestation in this image
+Isolation	all compilers & libraries live inside the image – the host stays clean
+Reproducibility	Ubuntu 22.04 + fully pinned 1.21 HTS stack
+Stateless	--rm so containers never keep state between runs
+Non-interactive batch	loops passed via bash -c – no shell login needed
+Volume mounts	data are streamed through -v binds, never copied into the image
 
-Drop the commands above into Nextflow, Snakemake, CWL, SLURM, or plain
-shell scripts and be sure every run uses the same, HTSlib-compatible
-fqtools build.
 
----
-# fqtools_docker
+
+⸻
+
+Patch notes / gotchas
+	•	Issue #18 in fqtools repo – fixed by rewriting the two outdated
+includes.
+	•	GCC 10 duplicate-symbol errors – compiled with -fcommon.
+	•	samtools tview needs libncursesw5-dev; that dev package is present
+only at build time, but the runtime ncurses libraries are baked into
+Ubuntu 22.04 so tview still works inside the final image.
+
+⸻
+
+FAQ
+	•	Q: Can I mount a directory read-only?
+A: Yes – prepend :ro to the -v spec.
+	•	Q: Will this break if I upgrade HTSlib on the host?
+A: No. The container carries its own copy of all libraries.
+	•	Q: Does fqtools support BAM input?
+A: Yes – that’s why we ship HTSlib inside the image.
+
+⸻
+
+License
+	•	fqtools & HTSlib stack: their respective open-source licences.
+	•	Dockerfile & documentation: © 2025 Anton Zhelonkin – MIT licence.

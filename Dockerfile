@@ -37,21 +37,23 @@ RUN wget -q \
     make -j"$(nproc)" && make install && cd .. && \
     rm -rf /build/* && ldconfig   # refresh linker cache
 
-# ─── 4. fqtools + patch for issue #18 ────────────────────────────────────────
+# ─── 4. build fqtools (patched) ──────────────────────────────────────────────
 WORKDIR /build
 RUN git clone --depth 1 https://github.com/alastair-droop/fqtools && \
     cd fqtools && \
+    # 1. pull a *header-compatible* copy of HTSlib 1.21
     git clone --branch 1.21 --depth 1 \
               --recurse-submodules --shallow-submodules \
               https://github.com/samtools/htslib && \
-    \
-    # --- patch: change <sam.h>/<bam.h> → "htslib/…h" (see GitHub issue #18)
+    # 2. patch the outdated #include’s              (GitHub issue #18)
     sed -i 's|<sam.h>|"htslib/sam.h"|' src/fqheader.h && \
     sed -i 's|<bam.h>|"htslib/bam.h"|' src/fqheader.h && \
-    \
-    # build private HTSlib copy (needed only for headers) & fqtools
+    # 3. build the vendored HTSlib just for the headers
     cd htslib && autoreconf -fi && ./configure && make -j"$(nproc)" && make install && \
-    cd .. && make -j"$(nproc)" && install -m 755 fqtools /usr/local/bin && \
+    # 4. build fqtools itself (GCC≥10 needs -fcommon)
+    cd ..   && make CFLAGS="-O2 -g -fcommon" -j"$(nproc)" && \
+    # 5. install the binary that ends up in ./bin/
+    install -m 755 bin/fqtools /usr/local/bin/fqtools && \
     cd / && rm -rf /build/*
 
 # ─── 5. strip tool-chain ─────────────────────────────────────────────────────
